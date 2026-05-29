@@ -801,22 +801,39 @@ does_path_match(
                                         payload_version,
                                         child_list_version,
                                         child_list_length]},
-    {ok, #{CurrentPath := Node}} = find_matching_nodes(
-                                     Tree,
-                                     lists:reverse([Component | ReversedPath]),
-                                     TreeOptions),
+    %% reckon-db-org fork patch (base: v0.17.2):
+    %% Upstream hard-matched `{ok, #{CurrentPath := Node}} =
+    %% find_matching_nodes(...)` here. When a trigger is evaluated for
+    %% the *deletion* of the very node at CurrentPath (delete_matching_nodes
+    %% side effects), find_matching_nodes returns
+    %% `{error, {khepri, node_not_found, _}}` for the now-absent node and
+    %% the badmatch crashed the Khepri/Ra state machine. Worse, that
+    %% delete command, replayed from the Ra log on every restart, made
+    %% the store permanently unrecoverable. A path-condition that must
+    %% query a node which no longer exists simply cannot be met, so the
+    %% path does not match — return false instead of crashing.
+    %% (Continuation split into does_matched_node_path_match/7 to keep
+    %% this clause shallow and isolate the absent-node guard.)
+    case find_matching_nodes(Tree, CurrentPath, TreeOptions) of
+        {ok, #{CurrentPath := Node}} ->
+            does_matched_node_path_match(
+              Condition, Component, Node, Path, PathPattern, ReversedPath1, Tree);
+        _NodeAbsentOrError ->
+            false
+    end.
+
+%% reckon-db-org fork: the post-lookup half of the path-condition clause of
+%% does_path_match/4, reached only once the node at the current path exists.
+does_matched_node_path_match(
+  Condition, Component, Node, Path, PathPattern, ReversedPath1, Tree) ->
     case khepri_condition:is_met(Condition, Component, Node) of
         true ->
-            ConditionMatchesGrandchildren =
-            case khepri_condition:applies_to_grandchildren(Condition) of
-                true ->
-                    does_path_match(
-                      Path, [Condition | PathPattern], ReversedPath1, Tree);
-                false ->
-                    false
-            end,
-            ConditionMatchesGrandchildren orelse
-              does_path_match(Path, PathPattern, ReversedPath1, Tree);
+            MatchesGrandchildren =
+                khepri_condition:applies_to_grandchildren(Condition)
+                andalso does_path_match(
+                          Path, [Condition | PathPattern], ReversedPath1, Tree),
+            MatchesGrandchildren orelse
+                does_path_match(Path, PathPattern, ReversedPath1, Tree);
         {false, _} ->
             false
     end.
