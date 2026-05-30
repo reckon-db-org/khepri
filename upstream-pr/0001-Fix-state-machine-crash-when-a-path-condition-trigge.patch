@@ -1,0 +1,155 @@
+From 582a23d675c733d6b3db822a2180ad283b2f0113 Mon Sep 17 00:00:00 2001
+From: beamologist <raf.lefever@erlef.org>
+Date: Sat, 30 May 2026 02:16:23 +0200
+Subject: [PATCH] Fix state machine crash when a path-condition trigger matches
+ a deleted node
+
+When a registered trigger's event-filter path pattern contains a
+condition (e.g. #if_child_list_length{}) at a non-terminal position,
+khepri_tree:does_path_match/4 queries the tree node at the current path
+to evaluate that condition. While evaluating the trigger for the
+*deletion* of that very node, find_matching_nodes/3 returns
+{error, {khepri, node_not_found, _}} for the now-absent node. The code
+hard-matched {ok, #{CurrentPath := Node}} = ..., so the badmatch crashed
+the Khepri/Ra state machine.
+
+Because the delete command is persisted in the Ra log, the crash
+replayed on every restart, leaving the store permanently unrecoverable
+(ra_server_sup -> reached_max_restart_intensity).
+
+A path condition that must query a node which no longer exists cannot be
+met, so the path simply does not match: return false instead of
+badmatching. The post-lookup branch is split into
+does_matched_node_path_match/7.
+
+Triggers with literal-only path patterns were unaffected (handled by the
+literal-component clauses), which is why existing delete-trigger tests
+did not catch this. Adds a regression test combining a path condition
+with the deletion of the matching node.
+
+Signed-off-by: beamologist <raf.lefever@erlef.org>
+---
+ src/khepri_tree.erl | 38 +++++++++++++++++++------------
+ test/triggers.erl   | 55 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 79 insertions(+), 14 deletions(-)
+
+diff --git a/src/khepri_tree.erl b/src/khepri_tree.erl
+index d4bb6e8..4fb31ba 100644
+--- a/src/khepri_tree.erl
++++ b/src/khepri_tree.erl
+@@ -801,22 +801,32 @@ does_path_match(
+                                         payload_version,
+                                         child_list_version,
+                                         child_list_length]},
+-    {ok, #{CurrentPath := Node}} = find_matching_nodes(
+-                                     Tree,
+-                                     lists:reverse([Component | ReversedPath]),
+-                                     TreeOptions),
++    %% The node at `CurrentPath' may no longer exist — most commonly when
++    %% this trigger is being evaluated for the *deletion* of that very node.
++    %% `find_matching_nodes/3' then returns
++    %% `{error, {khepri, node_not_found, _}}'. A path condition that must
++    %% query an absent node cannot be met, so the path does not match.
++    %% (Previously this hard-matched `{ok, _} = ...' and crashed the state
++    %% machine; as the delete command is persisted, it then replayed and
++    %% crashed on every restart, making the store unrecoverable.)
++    case find_matching_nodes(Tree, CurrentPath, TreeOptions) of
++        {ok, #{CurrentPath := Node}} ->
++            does_matched_node_path_match(
++              Condition, Component, Node, Path, PathPattern, ReversedPath1, Tree);
++        _NodeAbsentOrError ->
++            false
++    end.
++
++does_matched_node_path_match(
++  Condition, Component, Node, Path, PathPattern, ReversedPath1, Tree) ->
+     case khepri_condition:is_met(Condition, Component, Node) of
+         true ->
+-            ConditionMatchesGrandchildren =
+-            case khepri_condition:applies_to_grandchildren(Condition) of
+-                true ->
+-                    does_path_match(
+-                      Path, [Condition | PathPattern], ReversedPath1, Tree);
+-                false ->
+-                    false
+-            end,
+-            ConditionMatchesGrandchildren orelse
+-              does_path_match(Path, PathPattern, ReversedPath1, Tree);
++            MatchesGrandchildren =
++                khepri_condition:applies_to_grandchildren(Condition)
++                andalso does_path_match(
++                          Path, [Condition | PathPattern], ReversedPath1, Tree),
++            MatchesGrandchildren orelse
++                does_path_match(Path, PathPattern, ReversedPath1, Tree);
+         {false, _} ->
+             false
+     end.
+diff --git a/test/triggers.erl b/test/triggers.erl
+index 11d461b..822c96a 100644
+--- a/test/triggers.erl
++++ b/test/triggers.erl
+@@ -442,6 +442,61 @@ filter_on_change_type_test_() ->
+          ?_assertEqual(executed, receive_sproc_msg(DeletedKey))}]
+       }]}.
+ 
++deleting_a_node_matched_by_a_path_condition_does_not_crash_test_() ->
++    %% Regression test: a trigger whose event-filter path pattern contains
++    %% a *condition* (here `#if_child_list_length{}`) at a non-terminal
++    %% position must not crash the state machine when the matching node is
++    %% deleted. While evaluating the trigger for the delete,
++    %% `khepri_tree:does_path_match/4` queried the just-deleted node and
++    %% hard-matched `{ok, _} = find_matching_nodes(...)`; the lookup returns
++    %% `{error, {khepri, node_not_found, _}}` for the gone node, so the
++    %% badmatch crashed the Khepri/Ra state machine. As the delete command
++    %% is persisted, it replayed on every restart, making the store
++    %% permanently unrecoverable.
++    EventFilter = khepri_evf:tree([foo, #if_child_list_length{count = 0}]),
++    StoredProcPath = [sproc],
++    Key = ?FUNCTION_NAME,
++    {setup,
++     fun() -> test_ra_server_helpers:setup(?FUNCTION_NAME) end,
++     fun(Priv) -> test_ra_server_helpers:cleanup(Priv) end,
++     [{inorder,
++       [{"Storing a procedure",
++         ?_assertMatch(
++            ok,
++            khepri:put(
++              ?FUNCTION_NAME, StoredProcPath,
++              make_sproc(self(), Key)))},
++
++        {"Registering a trigger with a path condition",
++         ?_assertEqual(
++            ok,
++            khepri:register_trigger(
++              ?FUNCTION_NAME,
++              ?FUNCTION_NAME,
++              EventFilter,
++              StoredProcPath))},
++
++        {"Creating the matching node",
++         ?_assertMatch(
++            ok,
++            khepri:put(?FUNCTION_NAME, [foo, bar], value))},
++
++        {"Deleting the matching node must not crash the state machine",
++         ?_assertMatch(
++            ok,
++            khepri:delete(?FUNCTION_NAME, [foo, bar]))},
++
++        {"The store is still responsive after the delete-triggered eval",
++         ?_assertMatch(
++            ok,
++            khepri:put(?FUNCTION_NAME, [other], value))},
++
++        {"and reads still serve correctly",
++         ?_assertMatch(
++            {ok, value},
++            khepri:get(?FUNCTION_NAME, [other]))}]
++      }]}.
++
+ a_buggy_sproc_does_not_crash_state_machine_test_() ->
+     EventFilter = khepri_evf:tree([foo]),
+     StoredProcPath = [sproc],
+-- 
+2.54.0
+
